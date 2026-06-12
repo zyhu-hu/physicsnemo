@@ -410,3 +410,325 @@ class RotaryPositionEmbedding1D(nn.Module):
         cos = self.cos[:seq_len]
         sin = self.sin[:seq_len]
         return apply_rotary_pos_emb(q, cos, sin), apply_rotary_pos_emb(k, cos, sin)
+
+
+# --- Stereographic 2D RoPE (continuous spherical coordinates) ---
+#
+# A 2D RoPE for tokens that live on a sphere. Token latitude/longitude are mapped
+# to a local tangent plane with a stereographic projection, and the resulting
+# *continuous* (x, y) coordinates drive the same adjacent-pair rotation as the
+# axial RoPE above (via :func:`apply_rotary_pos_emb`). The only new ingredient is
+# a table builder for continuous positions; :func:`build_axial_rope_cos_sin` is
+# the integer-grid special case of :func:`build_rope_cos_sin_2d`.
+
+
+def stereographic_projection(
+    lat: torch.Tensor,
+    lon: torch.Tensor,
+    lat0: torch.Tensor,
+    lon0: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Project latitude / longitude onto a local tangent plane.
+
+    Stereographic projection of points :math:`(\text{lat}, \text{lon})` onto the
+    plane tangent to the sphere at the center :math:`(\text{lat}_0, \text{lon}_0)`,
+    with axes oriented so ``y`` points North and ``x`` points East. All inputs are
+    in radians and may broadcast against each other (e.g. ``lat`` of shape
+    :math:`(B, H, W)` with ``lat0`` of shape :math:`(B, 1, 1)`).
+
+    Parameters
+    ----------
+    lat : torch.Tensor
+        Latitude in radians, of shape :math:`(\ldots, H, W)`.
+    lon : torch.Tensor
+        Longitude in radians, of shape :math:`(\ldots, H, W)`.
+    lat0 : torch.Tensor
+        Center latitude in radians, broadcastable to ``lat``.
+    lon0 : torch.Tensor
+        Center longitude in radians, broadcastable to ``lon``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The projected ``(x, y)`` coordinates on the tangent plane (``x`` East,
+        ``y`` North), each of the broadcasted shape of the inputs.
+
+    Notes
+    -----
+    The projection diverges at the antipode of the center (:math:`\cos c = -1`).
+    The denominator is clamped so outputs stay finite there (large but not
+    infinite); this is intended for tiles local to the center, not whole-sphere use.
+    """
+    dlon = lon - lon0
+    # cos_c: cosine of the great-circle angle to the center; k: stereographic scale.
+    cos_c = torch.sin(lat0) * torch.sin(lat) + torch.cos(lat0) * torch.cos(
+        lat
+    ) * torch.cos(dlon)
+    # Guard the antipodal singularity (cos_c = -1, the point opposite the center),
+    # where the projection diverges: clamp the denominator so coordinates stay
+    # finite for tiles that approach it.
+    k = 2.0 / (1.0 + cos_c).clamp_min(1e-6)
+    x = k * torch.cos(lat) * torch.sin(dlon)
+    y = k * (
+        torch.cos(lat0) * torch.sin(lat)
+        - torch.sin(lat0) * torch.cos(lat) * torch.cos(dlon)
+    )
+    return x, y
+
+
+def mean_longitude(
+    lon: torch.Tensor,
+    reduce_dims: Tuple[int, ...] = (-2, -1),
+    return_0_2pi: bool = True,
+) -> torch.Tensor:
+    r"""Circular mean of longitude (handles the :math:`0 / 2\pi` seam).
+
+    Averages the unit vectors :math:`(\cos\text{lon}, \sin\text{lon})` and recovers
+    the angle with :func:`torch.atan2`, so the mean is correct across the
+    wrap-around. The reduced dimensions are kept (size 1) for broadcasting.
+
+    Parameters
+    ----------
+    lon : torch.Tensor
+        Longitude in radians, of shape :math:`(\ldots, H, W)`.
+    reduce_dims : Tuple[int, ...], optional, default=(-2, -1)
+        Dimensions to average over.
+    return_0_2pi : bool, optional, default=True
+        If ``True`` the result is wrapped to :math:`[0, 2\pi)`; otherwise to
+        :math:`[-\pi, \pi)`.
+
+    Returns
+    -------
+    torch.Tensor
+        The circular-mean longitude with the reduced dimensions kept as size 1.
+    """
+    sin_mean = lon.sin().mean(dim=reduce_dims, keepdim=True)
+    cos_mean = lon.cos().mean(dim=reduce_dims, keepdim=True)
+    lon_mean = torch.atan2(sin_mean, cos_mean)  # in [-pi, pi)
+    if return_0_2pi:
+        lon_mean = lon_mean % (2 * torch.pi)
+    return lon_mean
+
+
+def build_rope_cos_sin_2d(
+    x_pos: torch.Tensor,
+    y_pos: torch.Tensor,
+    head_dim: int,
+    theta: float = 10000.0,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Build 2D RoPE cos/sin tables from arbitrary continuous positions.
+
+    The continuous-position analog of :func:`build_axial_rope_cos_sin`: the first
+    ``head_dim/2`` channels rotate by ``x_pos`` and the last ``head_dim/2`` by
+    ``y_pos``, with the same frequency schedule
+    :math:`\theta_k = \text{theta}^{-2k/(head\_dim/2)}` and the same
+    adjacent-pair (``repeat_interleave``) layout, so the result composes with
+    :func:`apply_rotary_pos_emb`. Passing integer row / column indices reproduces
+    :func:`build_axial_rope_cos_sin` (flattened over the grid).
+
+    Parameters
+    ----------
+    x_pos : torch.Tensor
+        First-axis positions of shape :math:`(\ldots, N)`.
+    y_pos : torch.Tensor
+        Second-axis positions of shape :math:`(\ldots, N)` (same shape as ``x_pos``).
+    head_dim : int
+        Per-head channel dimension. Must be divisible by 4 (half per axis, then
+        adjacent pairs within each half).
+    theta : float, optional, default=10000.0
+        Base used for the RoPE frequency schedule.
+    device : torch.device, optional
+        Device to place the positions and returned tables on. If ``None``,
+        follows ``x_pos.device``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(cos, sin)``, each of shape :math:`(\ldots, N, head\_dim)`.
+    """
+    if head_dim % 4 != 0:
+        raise ValueError(
+            f"head_dim={head_dim} must be divisible by 4 for 2D RoPE "
+            f"(half per axis, then adjacent pairs within each half)."
+        )
+    # Move positions to the requested device (if any) so positions, frequencies,
+    # and the returned tables all share one device; otherwise follow x_pos.
+    if device is not None:
+        x_pos = x_pos.to(device)
+        y_pos = y_pos.to(device)
+    half = head_dim // 2  # channels per axis
+    k = torch.arange(0, half, 2, dtype=torch.float32, device=x_pos.device)
+    freqs = theta ** (-k / half)  # (head_dim/4,)
+
+    # Outer product of positions and frequencies -> per-token, per-axis angles.
+    x_ang = x_pos.to(torch.float32).unsqueeze(-1) * freqs  # (..., N, head_dim/4)
+    y_ang = y_pos.to(torch.float32).unsqueeze(-1) * freqs  # (..., N, head_dim/4)
+
+    # repeat_interleave(2) makes the adjacent channel pair (2k, 2k+1) share theta_k.
+    cos = torch.cat(
+        [
+            x_ang.cos().repeat_interleave(2, dim=-1),
+            y_ang.cos().repeat_interleave(2, dim=-1),
+        ],
+        dim=-1,
+    )  # (..., N, head_dim)
+    sin = torch.cat(
+        [
+            x_ang.sin().repeat_interleave(2, dim=-1),
+            y_ang.sin().repeat_interleave(2, dim=-1),
+        ],
+        dim=-1,
+    )
+    return cos.contiguous(), sin.contiguous()
+
+
+class StereographicRotaryPositionEmbedding2D(nn.Module):
+    r"""Stereographic 2D rotary position embedding for tokens on a sphere.
+
+    The continuous-coordinate counterpart of :class:`RotaryPositionEmbedding2D`.
+    Token positions, given as latitude / longitude, are mapped to a local tangent
+    plane via :func:`stereographic_projection`, and the resulting continuous
+    ``(x, y)`` coordinates drive a 2D RoPE on the query / key tensors (via
+    :func:`build_rope_cos_sin_2d` + :func:`apply_rotary_pos_emb`). Because the
+    positions depend on the input geometry, the cos/sin tables are built per
+    forward rather than cached as buffers, so the module is parameter-free and
+    stateless beyond its ``head_dim`` / ``theta`` configuration.
+
+    Parameters
+    ----------
+    head_dim : int
+        Per-head channel dimension. Must be divisible by 4.
+    theta : float, optional, default=10000.0
+        Base used for the RoPE frequency schedule.
+
+    Forward
+    -------
+    q, k : torch.Tensor
+        Query / key tensors of shape :math:`(\ldots, N, head\_dim)`.
+    x_pos, y_pos : torch.Tensor
+        Continuous tangent-plane coordinates of shape :math:`(N,)` (shared across
+        the batch) or :math:`(B, N)` (per sample), e.g. from :meth:`project`. For
+        the standard :math:`(B, \text{heads}, N, head\_dim)` ``q`` / ``k`` layout a
+        heads axis is inserted automatically so per-sample tables broadcast over heads.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The rotated ``(q, k)``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from physicsnemo.nn.module.rope import StereographicRotaryPositionEmbedding2D
+    >>> rope = StereographicRotaryPositionEmbedding2D(head_dim=16)
+    >>> q = torch.randn(2, 4, 6, 16)  # (B, heads, N, head_dim)
+    >>> k = torch.randn(2, 4, 6, 16)
+    >>> x = torch.randn(6)            # continuous per-token coordinates
+    >>> y = torch.randn(6)
+    >>> q_rot, k_rot = rope(q, k, x, y)
+    >>> q_rot.shape
+    torch.Size([2, 4, 6, 16])
+    """
+
+    def __init__(self, head_dim: int, theta: float = 10000.0):
+        super().__init__()
+        if head_dim % 4 != 0:
+            raise ValueError(
+                f"head_dim={head_dim} must be divisible by 4 for stereographic 2D RoPE."
+            )
+        self.head_dim = int(head_dim)
+        self.theta = float(theta)
+
+    def project(
+        self,
+        lat: torch.Tensor,
+        lon: torch.Tensor,
+        lat0: Optional[torch.Tensor] = None,
+        lon0: Optional[torch.Tensor] = None,
+        reduce_dims: Tuple[int, ...] = (-2, -1),
+        length_scale: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Map latitude / longitude to stereographic tangent-plane coordinates.
+
+        When ``lat0`` / ``lon0`` are not given, the projection center is the
+        per-tile mean of the inputs (plain mean for latitude, circular mean for
+        longitude via :func:`mean_longitude`).
+
+        Parameters
+        ----------
+        lat : torch.Tensor
+            Latitude in radians, of shape :math:`(\ldots, H, W)`.
+        lon : torch.Tensor
+            Longitude in radians, of shape :math:`(\ldots, H, W)`.
+        lat0 : torch.Tensor, optional
+            Center latitude in radians; if ``None``, the mean of ``lat`` over
+            ``reduce_dims``.
+        lon0 : torch.Tensor, optional
+            Center longitude in radians; if ``None``, the circular mean of ``lon``.
+        reduce_dims : Tuple[int, ...], optional, default=(-2, -1)
+            Dimensions used to compute the center when ``lat0`` / ``lon0`` are not given.
+        length_scale : float, optional
+            If given, the coordinates are divided by this value. Use it to bring the
+            projected coordinates to roughly token-spacing units so the RoPE
+            frequencies behave like the integer-grid case.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            The tangent-plane ``(x, y)`` coordinates (East, North), of the shape of ``lat``.
+        """
+        if lat0 is None:
+            lat0 = lat.mean(dim=reduce_dims, keepdim=True)
+        if lon0 is None:
+            lon0 = mean_longitude(lon, reduce_dims=reduce_dims)
+        x, y = stereographic_projection(lat, lon, lat0, lon0)
+        if length_scale is not None:
+            if length_scale <= 0:
+                raise ValueError(f"length_scale must be > 0, got {length_scale}")
+            x = x / length_scale
+            y = y / length_scale
+        return x, y
+
+    def build_tables(
+        self,
+        x_pos: torch.Tensor,
+        y_pos: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Build the ``(cos, sin)`` RoPE tables for continuous coordinates.
+
+        Thin wrapper over :func:`build_rope_cos_sin_2d` using this module's
+        ``head_dim`` and ``theta``.
+
+        Parameters
+        ----------
+        x_pos, y_pos : torch.Tensor
+            Continuous coordinates of shape :math:`(\ldots, N)`.
+        device : torch.device, optional
+            Device for the frequency table.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            ``(cos, sin)``, each of shape :math:`(\ldots, N, head\_dim)`.
+        """
+        return build_rope_cos_sin_2d(
+            x_pos, y_pos, self.head_dim, theta=self.theta, device=device
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        x_pos: torch.Tensor,
+        y_pos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = self.build_tables(x_pos, y_pos, device=q.device)
+        # Per-sample (batched) coordinates give tables with one fewer dim than
+        # q/k (no heads axis); insert it so they broadcast over the heads dim of
+        # the standard (..., heads, N, head_dim) attention layout.
+        if cos.ndim == q.ndim - 1:
+            cos = cos.unsqueeze(-3)
+            sin = sin.unsqueeze(-3)
+        return apply_rotary_pos_emb(q, cos, sin), apply_rotary_pos_emb(k, cos, sin)

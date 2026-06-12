@@ -20,10 +20,14 @@ import torch
 from physicsnemo.nn.module.rope import (
     RotaryPositionEmbedding1D,
     RotaryPositionEmbedding2D,
+    StereographicRotaryPositionEmbedding2D,
     apply_rotary_pos_emb,
     build_axial_rope_cos_sin,
     build_rope_cos_sin_1d,
+    build_rope_cos_sin_2d,
+    mean_longitude,
     rotate_half_pairs,
+    stereographic_projection,
 )
 
 
@@ -200,3 +204,121 @@ def test_rotary_1d_relative_phase_is_translation_invariant():
     # Offset of 3 gives the same score regardless of absolute position.
     assert torch.allclose(dot(5, 2), dot(20, 17), atol=1e-4)
     assert torch.allclose(dot(10, 4), dot(30, 24), atol=1e-4)
+
+
+# --- Stereographic 2D RoPE ---
+
+
+@torch.no_grad()
+def test_build_rope_cos_sin_2d_matches_axial():
+    """Integer row/col coordinates reproduce build_axial_rope_cos_sin (flattened)."""
+    h, w, head_dim = 3, 5, 16
+    rows = torch.arange(h).reshape(h, 1).expand(h, w).reshape(-1).float()
+    cols = torch.arange(w).reshape(1, w).expand(h, w).reshape(-1).float()
+    cos2, sin2 = build_rope_cos_sin_2d(rows, cols, head_dim)
+    cos_ax, sin_ax = build_axial_rope_cos_sin(h, w, head_dim)
+    assert cos2.shape == (h * w, head_dim)
+    assert torch.allclose(cos2, cos_ax.reshape(h * w, head_dim), atol=1e-6)
+    assert torch.allclose(sin2, sin_ax.reshape(h * w, head_dim), atol=1e-6)
+    # head_dim must be divisible by 4.
+    with pytest.raises(ValueError):
+        build_rope_cos_sin_2d(rows, cols, head_dim=6)
+
+
+@torch.no_grad()
+def test_stereographic_projection_geometry():
+    """Center maps to the origin; East gives x > 0, North gives y > 0."""
+    zero = torch.zeros(1, 1, 1)
+    x, y = stereographic_projection(
+        torch.zeros(1, 3, 3), torch.zeros(1, 3, 3), zero, zero
+    )
+    assert torch.allclose(x, torch.zeros_like(x), atol=1e-6)
+    assert torch.allclose(y, torch.zeros_like(y), atol=1e-6)
+    x_east, _ = stereographic_projection(zero, torch.full((1, 1, 1), 0.2), zero, zero)
+    assert float(x_east) > 0.0
+    _, y_north = stereographic_projection(torch.full((1, 1, 1), 0.2), zero, zero, zero)
+    assert float(y_north) > 0.0
+
+
+@torch.no_grad()
+def test_mean_longitude_handles_seam():
+    """Circular mean of angles straddling the 0 / 2*pi seam is ~0, not ~pi."""
+    lon = torch.tensor([[[0.1, 2 * torch.pi - 0.1]]])
+    m = mean_longitude(lon, reduce_dims=(-2, -1)).reshape(())
+    wrapped = (m + torch.pi) % (2 * torch.pi) - torch.pi  # to [-pi, pi)
+    assert abs(float(wrapped)) < 1e-5
+
+
+@torch.no_grad()
+def test_stereo_rope_module_shapes_and_validation():
+    rope = StereographicRotaryPositionEmbedding2D(head_dim=16)
+    q = torch.randn(2, 4, 6, 16)
+    k = torch.randn(2, 4, 6, 16)
+    x_pos = torch.randn(6)
+    y_pos = torch.randn(6)
+    q_rot, k_rot = rope(q, k, x_pos, y_pos)
+    assert q_rot.shape == q.shape and k_rot.shape == k.shape
+    # Rotation preserves the per-token norm.
+    assert torch.allclose(q_rot.norm(dim=-1), q.norm(dim=-1), atol=1e-4)
+    # head_dim must be divisible by 4.
+    with pytest.raises(ValueError):
+        StereographicRotaryPositionEmbedding2D(head_dim=6)
+
+
+@torch.no_grad()
+def test_stereo_rope_relative_position_invariance():
+    """RoPE encodes relative position: shifting all coordinates by a constant
+    leaves the query-key score matrix unchanged."""
+    torch.manual_seed(0)
+    rope = StereographicRotaryPositionEmbedding2D(head_dim=16)
+    q = torch.randn(1, 2, 6, 16)
+    k = torch.randn(1, 2, 6, 16)
+    x_pos = torch.randn(6)
+    y_pos = torch.randn(6)
+
+    q1, k1 = rope(q, k, x_pos, y_pos)
+    scores1 = q1 @ k1.transpose(-1, -2)
+    q2, k2 = rope(q, k, x_pos + 0.7, y_pos - 1.3)
+    scores2 = q2 @ k2.transpose(-1, -2)
+    assert torch.allclose(scores1, scores2, atol=1e-4)
+
+
+@torch.no_grad()
+def test_stereo_rope_forward_batched_coords():
+    """Per-sample (B, N) coordinates broadcast over heads automatically."""
+    torch.manual_seed(0)
+    rope = StereographicRotaryPositionEmbedding2D(head_dim=16)
+    B, heads, n = 2, 4, 6
+    q = torch.randn(B, heads, n, 16)
+    k = torch.randn(B, heads, n, 16)
+    x_pos = torch.randn(B, n)  # distinct coords per batch sample
+    y_pos = torch.randn(B, n)
+    q_rot, k_rot = rope(q, k, x_pos, y_pos)
+    assert q_rot.shape == q.shape and k_rot.shape == k.shape
+    # Equivalent to manually inserting the heads axis into the tables.
+    cos, sin = rope.build_tables(x_pos, y_pos)
+    expected = apply_rotary_pos_emb(q, cos.unsqueeze(-3), sin.unsqueeze(-3))
+    assert torch.allclose(q_rot, expected, atol=1e-6)
+
+
+@torch.no_grad()
+def test_stereographic_projection_finite_near_antipode():
+    """The antipodal singularity is guarded: outputs stay finite, not inf/nan."""
+    zero = torch.zeros(1, 1, 1)
+    # A point at the antipode of the center (dlon = pi, same latitude) has
+    # cos_c = -1, the projection's singular point.
+    lat = torch.zeros(1, 1, 1)
+    lon = torch.full((1, 1, 1), float(torch.pi))
+    x, y = stereographic_projection(lat, lon, zero, zero)
+    assert torch.isfinite(x).all() and torch.isfinite(y).all()
+
+
+@torch.no_grad()
+def test_stereo_rope_project_rejects_nonpositive_length_scale():
+    rope = StereographicRotaryPositionEmbedding2D(head_dim=16)
+    lat = torch.zeros(1, 4, 4)
+    lon = torch.zeros(1, 4, 4)
+    with pytest.raises(ValueError):
+        rope.project(lat, lon, length_scale=0.0)
+    with pytest.raises(ValueError):
+        rope.project(lat, lon, length_scale=-1.0)
